@@ -1,0 +1,145 @@
+# ============================================
+# Configuration for Market Anomalies Ingestion
+# ============================================
+
+wrds:
+  username: "your_wrds_username"  # Your WRDS username
+  # Password will be prompted or stored in ~/.pgpass
+
+# --- Date Range Configuration ---
+date_range:
+  days_back: 90  # Default lookback for CRSP and short-term data
+  long_window_days: 180  # Longer window for fundamentals & governance
+
+# --- Dataset Selection ---
+datasets:
+  crsp:
+    enabled: true
+    exchanges: ['NYSE', 'NASDAQ', 'AMEX']
+    include_delisted: false
+
+  compustat:
+    enabled: true
+    frequency: quarterly  # quarterly or annual
+
+  ibes:
+    enabled: true
+    include_recommendations: true
+    include_estimates: true
+
+  sdc:
+    enabled: true
+    include_mna: true
+    include_ipo: false
+    include_jv: false
+
+  boardex:
+    enabled: true
+    include_roles: ['CEO', 'CFO', 'Director', 'Chair']
+
+  fred:
+    enabled: true
+    indicators:
+      - VIXCLS      # CBOE Volatility Index
+      - FEDFUNDS    # Federal Funds Effective Rate
+      - SP500       # S&P 500 Index
+      - T10Y2Y      # Treasury Yield Spread
+
+  yahoo_finance:
+    enabled: true
+    tickers:
+      - "^GSPC"
+      - "^VIX"
+      - "NVDA"
+      - "AAPL"
+
+  google_trends:
+    enabled: true
+    keywords:
+      - "Nvidia"
+      - "Apple"
+      - "Tesla"
+      - "Market crash"
+      - "Interest rates"
+
+# --- Data Quality Thresholds ---
+quality_thresholds:
+  crsp:
+    min_volume: 1000       # Minimum daily volume
+    max_return_abs: 0.5    # Filter extreme outliers (50%+ moves)
+
+  ibes:
+    min_analyst_coverage: 3  # Minimum analysts for high confidence
+
+  compustat:
+    require_complete_financials: false
+
+  sdc:
+    min_deal_value_musd: 10  # Ignore micro-deals
+
+# --- Anomaly Detection Parameters ---
+anomalies:
+  volatility:
+    zscore_threshold: 2.0
+    rolling_window: 20
+
+  fundamentals:
+    zscore_threshold: -2.0   # below sector average
+
+  governance:
+    turnover_threshold: 0.3  # fraction of board changed
+
+  mna:
+    deal_spike_std: 2.5      # spike threshold in sector deal counts
+
+  sentiment:
+    google_trend_spike: 2.0  # z-score for search attention spike
+
+# --- Output Configuration ---
+output:
+  data_dir: "./data"
+  schema_dir: "./schemas"
+  format: "parquet"       # parquet or csv
+  compression: "snappy"   # For parquet files
+  overwrite_existing: true
+
+# --- Logging ---
+logging:
+  level: "INFO"
+  log_file: "./logs/ingestion.log"
+
+# --- External APIs ---
+fred:
+  api_key: "your_fred_api_key"
+
+yahoo_finance:
+  retry_attempts: 3
+
+google_trends:
+  hl: "en-US"
+  tz: 360  # UTC offset in minutes
+
+# --- Database Storage (Optional) ---
+database:
+  enabled: false
+  type: "postgresql"
+  host: "localhost"
+  port: 5432
+  database: "market_anomalies"
+  user: "postgres"
+  password_env: "DB_PASSWORD"
+
+# --- Text2SQL Agent Configuration (to be updated) ---
+text2sql:
+  model: "claude-3-sonnet-20250514"
+  temperature: 0
+  max_tokens: 4000
+  available_datasets:
+    - crsp
+    - compustat
+    - ibes
+    - sdc
+    - boardex
+    - fred
+    - yahoo_finance
+    - google_trends
