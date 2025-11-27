@@ -3,6 +3,14 @@ import pandas as pd
 
 
 class CRSPIngestor(WRDSDataIngestor):
+    def fetch_if_needed(self, name: str, start: str, end: str) -> pd.DataFrame:
+        if self.data_exists(name):
+            return self.load_data(name)
+
+        df = self.fetch_daily_stock_data(start, end)
+        self.save_data(df, name)
+        return df
+
     # noinspection SqlNoDataSourceInspection,SqlDialectInspection
     def fetch_daily(self, start: str, end: str) -> pd.DataFrame:
         q = f"""
@@ -14,21 +22,23 @@ class CRSPIngestor(WRDSDataIngestor):
                 a.prc, -- price
                 a.shrout, -- shares outstanding
                 a.ret, -- return
-                a.shrcd, -- share code for filtering
-                a.hexcd, -- exchange code for filtering
+                a.exchcd,
                 
-                -- to get the final corrected return
-                COALESCE(b.dlretx, a.ret) AS final_ret,
+                -- delisting returns
+                b.dlret,
                 
-                -- compustat link keys
-                c.gvkey,
+                -- compustat link link codes
                 c.linktype,
                 c.linkdt,
-                c.linkenddt
+                c.linkenddt,
+
+                -- to get the final corrected return
+                COALESCE(b.dlret, a.ret) AS final_ret
+
 
             FROM
                 -- primary monthly stock data
-                crsp.msf AS a
+                crsp.dsf AS a
 
                 -- filter by delisting events
             LEFT JOIN
@@ -42,12 +52,13 @@ class CRSPIngestor(WRDSDataIngestor):
                 ON a.permno = c.lpermno
                 AND a.date >= c.linkdt
                 AND (a.date <= c.linkenddt OR c.linkenddt IS NULL)
-                
+
                 -- filter major exchanges and by desired dates
             WHERE
-                a.hexcd IN (1, 2, 3)
-                AND a.shrcd IN (10, 11)
+                a.exchcd IN (1, 2, 3) -- NYSE, AEX, NASDAQ
                 AND a.date BETWEEN '{start}' AND '{end}'
+            ORDER BY
+                a.permno, a.data
         """
 
         return self.conn.raw_sql(q)

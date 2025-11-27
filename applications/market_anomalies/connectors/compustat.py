@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Dict
 import pandas as pd
-from ._wrds_base import WRDSDataIngestor
+from ._wrds_base import WRDSDataIngestor, logger
 
 class CompustatIngestor(WRDSDataIngestor):
     """
@@ -13,11 +13,10 @@ class CompustatIngestor(WRDSDataIngestor):
     def fetch_quarterly_fundamentals(self, start_date: str, end_date: str) -> pd.DataFrame:
         q = f"""
         SELECT 
-            a.gvkey,
+            a.gvkey, -- need this to merge with CRSP
             a.datadate,
             a.fyearq,
             a.fqtr,
-            b.tic   AS ticker,
             b.conm  AS company_name,
             b.sic,
             -- Income statement (quarterly)
@@ -28,6 +27,7 @@ class CompustatIngestor(WRDSDataIngestor):
             a.atq   AS total_assets,
             a.ltq   AS total_liabilities,
             a.seqq  AS shareholders_equity
+            
         FROM comp.fundq a
         LEFT JOIN comp.company b
           ON a.gvkey = b.gvkey
@@ -59,8 +59,18 @@ class CompustatIngestor(WRDSDataIngestor):
 
         return df
 
+    def fetch_if_needed(self, name: str, start: str, end: str) -> pd.DataFrame:
+        if self.data_exists(name):
+            logger.info("Loading cached Compustat quarterly data: %s", name)
+            return self.load_data(name)
+
+        logger.info("Fetching Compustat quarterly data from WRDS...")
+        df = self.fetch_quarterly(start, end)
+        self.save_data(df, name)
+        return df
+
     @staticmethod
-    def schema_doc() -> Dict:
+    def get_schema_documentation() -> Dict:
         return {
             "dataset": "Compustat Quarterly Fundamentals",
             "library": "comp",
