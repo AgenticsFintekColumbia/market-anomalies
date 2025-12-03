@@ -18,9 +18,8 @@ summary agent provides a natural-language explanation citing evidence from each 
 1. Clone the repository fork:
 
 ```
-git clone https://github.com/aclarkse/Agentics
-cd Agentics/applications/market_anomalies
-
+git clone https://github.com/AgenticsFintekColumbia/market-anomalies
+cd AgenticsFintekColumbia/applications/market_anomalies
 ```
 
 2. Create a virtual environment:
@@ -38,7 +37,7 @@ pip install -r requirements.txt
 
 ## ⚙️Environment Variables & Configuration
 
-Add a `.env` file in `application/market_anomalies` with:
+Add a `.env` file in `applications/market_anomalies` with:
 
 ```
 WRDS_USERNAME=your_wrds_username
