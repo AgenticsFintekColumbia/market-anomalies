@@ -87,6 +87,6 @@ streamlit run app.py
 ```
 
 ## 👨‍💻 Authors & Contributors
-Andrea Clark (aoc2111@columbia.edu)
-Agostino Capponi
-Alfio Gliozzo
+- Andrea Clark (aoc2111@columbia.edu)
+- Agostino Capponi
+- Alfio Gliozzo
