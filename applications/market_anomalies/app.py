@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, ConfigDict, Field
+from composite_anomaly import CompositeAnomalyDetector
+
 
 # --- 1. Page Config (MUST BE FIRST) ---
 st.set_page_config(page_title="WRDS Market Anomaly Hunter", page_icon="📈", layout="wide")
@@ -259,6 +261,16 @@ class Text2sqlQuestion(BaseModel):
         None, description="The final natural language report answering the user's question"
     )
 
+class AnomalySummaryState(BaseModel):
+    ticker: str
+    composite_score: float
+    components_json: str  # JSON dump of the components dict to load
+    summary_markdown: Optional[str] = Field(
+        default=None,
+        description="Human-readable anomaly summary to show in the UI.",
+    )
+
+
 
 # --- 6. Helper Functions ---
 @st.cache_data(show_spinner="Reading Schema...")
@@ -466,6 +478,127 @@ async def execute_query_map(state: Text2sqlQuestion) -> Text2sqlQuestion:
         state.system_output_df = await async_execute_sql(state.generated_query, DB_PATH)
     return state
 
+async def generate_anomaly_summary(
+    ticker: str,
+    composite_score: float,
+    components: Dict[str, Any],
+) -> str:
+    """
+    Use Agentics + Gemini to compress composite anomaly info into a short, readable report.
+    """
+    payload = {
+        "ticker": ticker,
+        "composite_score": composite_score,
+        "ids": components.get("ids"),
+        "crsp": components.get("crsp"),
+        "compustat": components.get("compustat"),
+        "ibes_eps": components.get("ibes_eps"),
+        "ibes_recs": components.get("ibes_recs"),
+        "weights": components.get("weights", {}),
+        "latest_composite_score": components.get("latest_composite_score", composite_score),
+    }
+    components_json = json.dumps(payload, default=str, indent=2)
+
+    state = AnomalySummaryState(
+        ticker=ticker,
+        composite_score=composite_score,
+        components_json=components_json,
+    )
+
+    try:
+        agent = AG(states=[state], atype=AnomalySummaryState)
+    except Exception:
+        agent = AG()
+        agent.states = [state]
+
+    agent.llm = AG.get_llm_provider()
+
+    agent = await agent.self_transduction(
+        ["ticker", "composite_score", "components_json"],
+        ["summary_markdown"],
+        instructions="""
+        You are a senior equity analyst writing a brief anomaly assessment for a portfolio manager.
+
+        You receive a JSON object in `components_json` with fields:
+          - ticker
+          - composite_score in [0,1]
+          - ids: mapping with identifiers (ticker, permno, cusip, gvkey)
+          - crsp: CRSP-specific diagnostics (may include a score and/or time series stats;
+                  if available, it may contain a volatility z-score under a key like `vol_z`
+                  and a CRSP anomaly score in [0,1]).
+          - compustat: { score, raw_row } where:
+                • score in [0,1] is a fundamentals anomaly score
+                • raw_row has quarterly fundamentals and sector-relative z-scores
+          - ibes_eps: { score, raw_row } where:
+                • score in [0,1] is an earnings-surprise anomaly score
+                • raw_row has consensus_estimate, actual_eps, num_analysts, etc.
+          - ibes_recs: { score, num_records } where:
+                • score in [0,1] reflects bearish/bullish analyst sentiment
+                • num_records is the number of recent recommendation records
+          - weights: { crsp, compustat, ibes_eps, ibes_recs } giving the
+                contribution of each dataset to the composite score.
+          - latest_composite_score: the most recent composite anomaly.
+
+        INTERPRETATION OF composite_score:
+          • 0.0–0.3 → "low anomaly"
+          • 0.3–0.6 → "moderate anomaly"
+          • 0.6–0.8 → "high anomaly"
+          • 0.8–1.0 → "extreme anomaly"
+
+        IMPORTANT: The CRSP volatility anomaly score is derived from a volatility z-score (vol_z)
+        using this approximate mapping from |z| to anomaly level:
+          - |z| ≤ 0.5  → anomaly score ≈ 0.0  (very normal volatility)
+          - |z| ≈ 1.5  → anomaly score ≈ 0.33 (mildly elevated volatility)
+          - |z| ≈ 2.0  → anomaly score ≈ 0.5  (moderate volatility anomaly)
+          - |z| ≥ 3.0  → anomaly score ≈ 1.0  (strong volatility anomaly, tail event)
+
+        If a CRSP volatility z-score (e.g. `vol_z`) is present in the JSON, explicitly mention it
+        and briefly relate the reported CRSP anomaly score to this mapping so the reader understands
+        how "unusual" the volatility is in standard deviation units.
+
+        TASK:
+        - Produce a SHORT Markdown report (max ~10 lines) with:
+
+          1. One-sentence headline stating overall anomaly level for the ticker
+             based on composite_score.
+
+          2. A bullet list of 3–5 key points:
+             - CRSP: explain whether market behavior (returns/volatility) is normal,
+               mildly unusual, or strongly unusual. If a volatility z-score is present,
+               mention its approximate value (e.g., "volatility is about 2.1 standard
+               deviations above its own history") and connect it to the mapping above
+               (e.g., "this corresponds to a moderate volatility anomaly").
+             - Compustat: interpret fundamentals anomaly from compustat.score and
+               the raw fundamentals in compustat.raw_row (e.g. margins vs sector,
+               leverage, profitability trends).
+             - IBES EPS: describe earnings surprises and analyst coverage based on
+               ibes_eps.score and ibes_eps.raw_row (consensus vs actual EPS,
+               num_analysts, etc.).
+             - IBES Recommendations: describe analyst sentiment based on
+               ibes_recs.score and ibes_recs.num_records (e.g. more bearish,
+               neutral, or supportive), if data is present.
+
+          3. A final line explaining that the composite anomaly score is a
+             weighted combination of these signals, explicitly referencing the
+             weights (e.g. "most weight on CRSP and Compustat").
+
+        IMPORTANT RULES:
+        - Use qualitative language only (e.g. "elevated volatility", "mildly weak
+          fundamentals", "strongly negative earnings surprise").
+        - If a dataset has score = null/None, say:
+             "No reliable signal from Compustat" (or the relevant source).
+        - Refer to the weights to describe which sources are most influential;
+          e.g., if weights.crsp is largest, say that market behavior is the
+          primary driver of the anomaly.
+        - DO NOT output JSON; return only well-formatted Markdown.
+        """,
+    )
+
+    result_state = agent.states[0]
+    if isinstance(result_state, tuple):
+        result_state = result_state[0]
+
+    return result_state.summary_markdown or "Summary generation failed."
 
 # --- Main App Logic ---
 
@@ -490,6 +623,7 @@ with st.sidebar:
         with st.expander("🔎 Database Inspector", expanded=False):
             stats_text, max_d = get_data_range_stats(DB_PATH)
             st.text(stats_text)
+
 
 st.title("📊 WRDS Market Anomaly Hunter")
 st.markdown("Find market anomalies (Momentum, PEAD, Reversals) using natural language.")
@@ -516,7 +650,7 @@ else:
         db_needs_build = True
 
 if db_needs_build:
-    st.warning(f"⚠️ Database incomplete (Missing CRSP data). Attempting to build from WRDS...")
+    st.warning("⚠️ Database incomplete (Missing CRSP data). Attempting to build from WRDS...")
 
     # Run the orchestrator logic to fetch and build the DB
     success = build_database(DB_PATH)
@@ -528,140 +662,238 @@ if db_needs_build:
         st.error("Could not build the database. Please check your WRDS credentials and connection.")
         st.stop()
 
-# Chat Interface
-if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant",
-                                  "content": "I am connected to your WRDS database. Try asking: 'Find stocks with the highest momentum over the last 3 months' or 'Which companies beat earnings estimates last quarter?'"}]
+# --- TABS: Text2SQL Agent (Tab 1) + Company Drilldown (Tab 2) ---
+tab_chat, tab_drill = st.tabs(["💬 Text2SQL Agent", "🔍 Company Drilldown"])
 
-for msg in st.session_state.messages:
-    st.chat_message(msg["role"]).write(msg["content"])
-
-if prompt := st.chat_input("E.g., Which stocks had the highest returns last quarter?"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    st.chat_message("user").write(prompt)
-
-    if not api_key:
-        st.error("Please provide a Gemini API Key.")
-        st.stop()
-
-
-    async def run_agentic_workflow():
-        with st.status("🚀 Agentics Workflow Running...", expanded=True) as status:
-
-            # 1. Initialize State
-            state = Text2sqlQuestion(
-                question=prompt,
-                db_id="market_anomalies"
+# =========================
+# TAB 1: Text2SQL Chat Agent
+# =========================
+with tab_chat:
+    # Chat Interface
+    if "messages" not in st.session_state:
+        st.session_state.messages = [{
+            "role": "assistant",
+            "content": (
+                "I am connected to your WRDS database. Try asking: "
+                "'Find stocks with the highest momentum over the last 3 months' "
+                "or 'Which companies beat earnings estimates last quarter?'"
             )
+        }]
 
-            # --- Step 1: Get Schema (Manual Call) ---
-            st.write("🔍 Identifying Tables & Schema...")
-            state = await get_schema_map(state)
+    for msg in st.session_state.messages:
+        st.chat_message(msg["role"]).write(msg["content"])
 
-            # --- Step 2: Generate SQL (Agentics Transduction) ---
-            st.write("🧠 Generating SQL Query...")
+    if prompt := st.chat_input("E.g., Which stocks had the highest returns last quarter?"):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        st.chat_message("user").write(prompt)
 
-            # Create fresh agent specifically for this step
-            try:
-                agent = AG(states=[state], atype=Text2sqlQuestion)
-            except Exception:
-                agent = AG()
-                agent.states = [state]
+        if not api_key:
+            st.error("Please provide a Gemini API Key.")
+            st.stop()
 
-            agent.llm = AG.get_llm_provider()
+        async def run_agentic_workflow():
+            with st.status("🚀 Agentics Workflow Running...", expanded=True) as status:
 
-            # DEFENSIVE: Ensure we don't have tuples before transduction
-            if agent.states and isinstance(agent.states[0], tuple):
-                st.warning("Detected tuple state, attempting to unwrap...")
-                agent.states = [agent.states[0][0]]
-
-            # Updated prompt to leverage the new schema context
-            agent = await agent.self_transduction(
-                ["question", "db_schema"],
-                ["generated_query"],
-                instructions="""
-                You are an expert financial data scientist. Use the provided schema JSON in `db_schema` to answer the question.
-
-                The `db_schema` JSON contains:
-                  - `sqlite_database_structure`  → actual tables/columns
-                  - `dataset_semantic_documentation` → human descriptions
-                  - `data_availability_summary`  → per-table min/max date ranges
-                  - `latest_data_date`           → the MAX date present in ANY table
-
-                ABSOLUTE CRITICAL RULES ABOUT DATES:
-                - The database only contains historical data up to `latest_data_date`.
-                - NEVER use dynamic date functions such as DATE('now'), date('now', ...),
-                  CURRENT_DATE, or variations of those.
-                - Instead, ALWAYS treat `latest_data_date` as "today".
-                - For example, if the user asks for "last 3 months":
-                    • Use a predicate like:
-                      WHERE some_date_column BETWEEN DATE('<latest_data_date>', '-3 months')
-                                                 AND DATE('<latest_data_date>')
-                    • Replace <latest_data_date> with the literal string from the JSON.
-
-                Other rules:
-                1. Use `dataset_semantic_documentation` to decide which tables are relevant.
-                2. Use `sqlite_database_structure` for exact column names.
-                3. Be careful with identifiers (permno vs ticker vs gvkey). If no mapping
-                   table is available, only join on identifiers that exist in BOTH tables.
-                4. Return ONLY valid SQLite SQL (no comments, no markdown fences).
-                """,
-            )
-
-            # Extract state back from agent (handling potential tuple return)
-            result_state = agent.states[0]
-            if isinstance(result_state, tuple):
-                result_state = result_state[0]
-
-            state.generated_query = result_state.generated_query
-            st.code(state.generated_query, language="sql")
-
-            # --- Step 3: Execute SQL (Manual Call) ---
-            st.write("⚡ Executing Query...")
-            state = await execute_query_map(state)
-
-            results = state.system_output_df
-
-            # --- Step 4: Generate Custom Report (Agentics Transduction) ---
-            final_report = ""
-            if results and not results.startswith("Error") and results != "[]":
-                st.write("📝 Synthesizing Report...")
-
-                # Update agent with results
-                agent.states = [state]
-
-                agent = await agent.self_transduction(
-                    ["question", "generated_query", "system_output_df"],
-                    ["final_report"],
-                    instructions="""
-                    You are a hedge fund analyst. 
-                    1. Read the user's question and the SQL results.
-                    2. Identify if there is a market anomaly (e.g., significant abnormal returns, earnings surprise).
-                    3. Write a concise report highlighting the top findings.
-                    4. Suggest a follow-up query if the data is inconclusive.
-                    """
+                # 1. Initialize State
+                state = Text2sqlQuestion(
+                    question=prompt,
+                    db_id="market_anomalies"
                 )
 
-                # Extract final report (again, handling tuples defensively)
-                final_state_obj = agent.states[0]
-                if isinstance(final_state_obj, tuple):
-                    final_state_obj = final_state_obj[0]
+                # --- Step 1: Get Schema (Manual Call) ---
+                st.write("🔍 Identifying Tables & Schema...")
+                state = await get_schema_map(state)
 
-                if hasattr(final_state_obj, 'final_report'):
-                    final_report = final_state_obj.final_report
+                # --- Step 2: Generate SQL (Agentics Transduction) ---
+                st.write("🧠 Generating SQL Query...")
+
+                # Create fresh agent specifically for this step
+                try:
+                    agent = AG(states=[state], atype=Text2sqlQuestion)
+                except Exception:
+                    agent = AG()
+                    agent.states = [state]
+
+                agent.llm = AG.get_llm_provider()
+
+                # DEFENSIVE: Ensure we don't have tuples before transduction
+                if agent.states and isinstance(agent.states[0], tuple):
+                    st.warning("Detected tuple state, attempting to unwrap...")
+                    agent.states = [agent.states[0][0]]
+
+                # Updated prompt to leverage the new schema context
+                agent = await agent.self_transduction(
+                    ["question", "db_schema"],
+                    ["generated_query"],
+                    instructions="""
+                    You are an expert financial data scientist. Use the provided schema JSON in `db_schema` to answer the question.
+
+                    The `db_schema` JSON contains:
+                      - `sqlite_database_structure`  → actual tables/columns
+                      - `dataset_semantic_documentation` → human descriptions
+                      - `data_availability_summary`  → per-table min/max date ranges
+                      - `latest_data_date`           → the MAX date present in ANY table
+
+                    ABSOLUTE CRITICAL RULES ABOUT DATES:
+                    - The database only contains historical data up to `latest_data_date`.
+                    - NEVER use dynamic date functions such as DATE('now'), date('now', ...),
+                      CURRENT_DATE, or variations of those.
+                    - Instead, ALWAYS treat `latest_data_date` as "today".
+                    - For example, if the user asks for "last 3 months":
+                        • Use a predicate like:
+                          WHERE some_date_column BETWEEN DATE('<latest_data_date>', '-3 months')
+                                                     AND DATE('<latest_data_date>')
+                        • Replace <latest_data_date> with the literal string from the JSON.
+
+                    Other rules:
+                    1. Use `dataset_semantic_documentation` to decide which tables are relevant.
+                    2. Use `sqlite_database_structure` for exact column names.
+                    3. Be careful with identifiers (permno vs ticker vs gvkey). If no mapping
+                       table is available, only join on identifiers that exist in BOTH tables.
+                    4. Return ONLY valid SQLite SQL (no comments, no markdown fences).
+                    """,
+                )
+
+                # Extract state back from agent (handling potential tuple return)
+                result_state = agent.states[0]
+                if isinstance(result_state, tuple):
+                    result_state = result_state[0]
+
+                state.generated_query = result_state.generated_query
+                st.code(state.generated_query, language="sql")
+
+                # --- Step 3: Execute SQL (Manual Call) ---
+                st.write("⚡ Executing Query...")
+                state = await execute_query_map(state)
+
+                results = state.system_output_df
+
+                # --- Step 4: Generate Custom Report (Agentics Transduction) ---
+                final_report = ""
+                if results and not results.startswith("Error") and results != "[]":
+                    st.write("📝 Synthesizing Report...")
+
+                    # Update agent with results
+                    agent.states = [state]
+
+                    agent = await agent.self_transduction(
+                        ["question", "generated_query", "system_output_df"],
+                        ["final_report"],
+                        instructions="""
+                        You are a hedge fund analyst. 
+                        1. Read the user's question and the SQL results.
+                        2. Identify if there is a market anomaly (e.g., significant abnormal returns, earnings surprise).
+                        3. Write a concise report highlighting the top findings.
+                        4. Suggest a follow-up query if the data is inconclusive.
+                        """
+                    )
+
+                    # Extract final report (again, handling tuples defensively)
+                    final_state_obj = agent.states[0]
+                    if isinstance(final_state_obj, tuple):
+                        final_state_obj = final_state_obj[0]
+
+                    if hasattr(final_state_obj, 'final_report'):
+                        final_report = final_state_obj.final_report
+                    else:
+                        final_report = "Error: Report generation failed."
                 else:
-                    final_report = "Error: Report generation failed."
+                    final_report = (
+                        f"I could not retrieve data. The query execution returned: {results}\n\n"
+                        "**Hint:** Check the 'Database Inspector' in the sidebar to ensure your "
+                        "query date range matches the available data."
+                    )
+
+                status.update(label="✅ Workflow Complete", state="complete", expanded=False)
+                return final_report
+
+        # Run Async Loop
+        try:
+            response_text = asyncio.run(run_agentic_workflow())
+            st.write(response_text)
+            st.session_state.messages.append({"role": "assistant", "content": response_text})
+        except Exception as e:
+            st.error(f"Workflow failed: {e}")
+
+# ================================
+# TAB 2: Company Anomaly Drilldown
+# ================================
+with tab_drill:
+    st.header("🔍 Company Anomaly Drilldown")
+    st.markdown(
+        "Enter a ticker (e.g. `HEI`, `CCL`) to see its normalized price index and a "
+        "composite anomaly score combining CRSP, Compustat, and IBES."
+    )
+
+    ticker_input = st.text_input("Ticker symbol:", value="HEI").upper().strip()
+
+    if st.button("Analyze Company"):
+        if not ticker_input:
+            st.error("Please enter a ticker.")
+        else:
+            try:
+                detector = CompositeAnomalyDetector(DB_PATH)  # master_db default path is inferred
+                ts_df, composite_score, components = detector.compute_composite_for_ticker(ticker_input)
+
+            except FileNotFoundError as e:
+                st.error(str(e))
+                st.stop()
+            except Exception as e:
+                st.error(f"Composite anomaly computation failed: {e}")
+                st.stop()
+
+            if ts_df.empty:
+                st.error(components.get("error", f"No data found for ticker '{ticker_input}'."))
             else:
-                final_report = f"I could not retrieve data. The query execution returned: {results}\n\n**Hint:** Check the 'Database Inspector' in the sidebar to ensure your query date range matches the available data."
+                col1, col2 = st.columns([2, 1])
 
-            status.update(label="✅ Workflow Complete", state="complete", expanded=False)
-            return final_report
+                with col1:
+                    st.subheader(f"Price Index & Composite Anomaly — {ticker_input.upper()}")
+                    chart_df = ts_df.set_index("date")[["price_index", "composite_score"]]
+                    st.line_chart(chart_df)
 
+                with col2:
+                    st.subheader("Composite Anomaly Score")
+                    st.metric(
+                        label="Current composite anomaly (0–1)",
+                        value=f"{composite_score:.2f}",
+                        help="0 = normal, 1 = highly anomalous (CRSP + Compustat + IBES)."
+                    )
 
-    # Run Async Loop
-    try:
-        response_text = asyncio.run(run_agentic_workflow())
-        st.write(response_text)
-        st.session_state.messages.append({"role": "assistant", "content": response_text})
-    except Exception as e:
-        st.error(f"Workflow failed: {e}")
+                    st.subheader("🧾 Anomaly Summary")
+                    try:
+                        summary_md = asyncio.run(
+                            generate_anomaly_summary(
+                                ticker=ticker_input.upper(),
+                                composite_score=composite_score,
+                                components=components,
+                            )
+                        )
+                        st.markdown(summary_md)
+                    except Exception as e:
+                        st.error(f"Failed to generate anomaly summary: {e}")
+                        st.write("Composite score:", composite_score)
+
+                    # Optional: tuck raw debug info away
+                    with st.expander("🔍 Detailed component breakdown (debug)", expanded=False):
+                        st.json(components)
+            # if ts_df.empty:
+            #     st.error(components.get("error", f"No data found for ticker '{ticker_input}'."))
+            # else:
+            #     col1, col2 = st.columns([2, 1])
+            #
+            #     with col1:
+            #         st.subheader(f"Price Index & Composite Anomaly — {ticker_input}")
+            #         chart_df = ts_df.set_index("date")[["price_index", "composite_score"]]
+            #         st.line_chart(chart_df)
+            #
+            #     with col2:
+            #         st.subheader("Composite Anomaly Score")
+            #         st.metric(
+            #             label="Current composite anomaly (0–1)",
+            #             value=f"{composite_score:.2f}",
+            #             help="0 = normal, 1 = highly anomalous (CRSP + Compustat + IBES)."
+            #         )
+            #         st.markdown("**Component breakdown:**")
+            #         st.json(components)
+
