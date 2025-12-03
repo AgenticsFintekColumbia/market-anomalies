@@ -1,6 +1,6 @@
 # 📈 WRDS Market Anomaly Hunter
 
-LLM-powered anomaly detection using CRSP, Compustat, and IBES from [WRDS](https://wrds-www.wharton.upenn.edu/)
+LLM-powered anomaly detection using CRSP, Compustat, and IBES from [WRDS](https://wrds-www.wharton.upenn.edu/).
 
 This application identifies market anomalies for any U.S. publicly traded company by combining three WRDS datasets:
 
