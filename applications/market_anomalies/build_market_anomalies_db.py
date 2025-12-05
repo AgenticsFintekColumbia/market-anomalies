@@ -11,16 +11,6 @@ WRDS_DIR = DATA_DIR / "wrds"
 
 DB_PATH = DATA_DIR / "market_anomalies.db"
 
-
-# def load_parquet(name: str) -> pd.DataFrame:
-#     """
-#     name is something like 'crsp_daily', and we expect the file at:
-#     applications/data/wrds/<name>.parquet
-#     """
-#     path = WRDS_DIR / f"{name}.parquet"
-#     print("Loading:", path)
-#     return pd.read_parquet(path)
-
 def load_parquet(name: str) -> pd.DataFrame:
     """
     Load a parquet file from applications/data/wrds/ using either:
