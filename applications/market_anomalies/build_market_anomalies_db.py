@@ -19,26 +19,26 @@ def load_parquet(name: str) -> pd.DataFrame:
 
     Returns a pandas DataFrame.
     """
-    # First try exact match
+
+    # first try finding an exact file match
     exact_path = WRDS_DIR / f"{name}.parquet"
     if exact_path.exists():
         print("Loading:", exact_path)
         return pd.read_parquet(exact_path)
 
-    # Otherwise treat name as a prefix
+    # otherwise treat name as a prefix (the CRSP parquet)
     pattern = f"{name}*.parquet"
     matches = list(WRDS_DIR.glob(pattern))
 
     if not matches:
         raise FileNotFoundError(f"No parquet files match prefix '{name}' in {WRDS_DIR}")
 
-    # Choose the most recent (sorted lexicographically works with YYYY-MM-DD)
+    # choose the most recent date match for CRSP
     matches = sorted(matches)
     chosen = matches[-1]
 
     print(f"Loading latest matching file: {chosen}")
     return pd.read_parquet(chosen)
-
 
 
 def main():
