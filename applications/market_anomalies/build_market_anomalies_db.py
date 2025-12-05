@@ -1,10 +1,8 @@
 from pathlib import Path
 import os
 import sqlite3
-
 import pandas as pd
 
-# Match WRDSDataIngestor's default: applications/data
 PROJECT_ROOT = Path(__file__).resolve().parents[1]  # 'applications'
 DATA_DIR = Path(os.getenv("DATA_DIR", PROJECT_ROOT / "data"))
 WRDS_DIR = DATA_DIR / "wrds"
