@@ -7,13 +7,60 @@ import os
 import sys
 import json
 import yaml
-import logging
-import glob
-from datetime import datetime
+from gnews import GNews
+import datetime as dt
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, ConfigDict, Field
 from composite_anomaly import CompositeAnomalyDetector
+
+
+
+APP_ROOT = Path(__file__).resolve()
+MARKET_APP_ROOT = APP_ROOT.parents[0]
+APPLICATIONS_ROOT = APP_ROOT.parents[1]
+PROJECT_ROOT = APP_ROOT.parents[2]
+MASTER_DB_PATH = APPLICATIONS_ROOT / "data" / "wrds" / "master_db.parquet"
+GOOGLE_TRENDS_PATH = MARKET_APP_ROOT / "data" / "external" / "google_trends.parquet"
+
+
+@st.cache_data
+def get_company_name_for_ticker(ticker: str, _mtime: float | None = None) -> str | None:
+    if not MASTER_DB_PATH.exists():
+        return None
+
+    df = pd.read_parquet(MASTER_DB_PATH)
+
+    if "ticker" not in df.columns:
+        return None
+
+    mask = df["ticker"].astype(str).str.upper() == ticker.upper()
+    sub = df.loc[mask]
+
+    if sub.empty:
+        return None
+
+    name_cols = [
+        c for c in df.columns
+        if c.lower() in ("company_name", "comnam", "security_name", "name")
+    ]
+    if not name_cols:
+        return None
+
+    name_col = name_cols[0]
+    names = sub[name_col].dropna().unique()
+    return names[0] if len(names) > 0 else None
+
+
+@st.cache_data
+def load_google_trends() -> pd.DataFrame:
+    if not GOOGLE_TRENDS_PATH.exists():
+        return pd.DataFrame(columns=["date", "ticker", "trend_score", "source"])
+
+    df = pd.read_parquet(GOOGLE_TRENDS_PATH)
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    return df
+
 
 
 # --- 1. Page Config (MUST BE FIRST) ---
@@ -447,7 +494,9 @@ async def generate_anomaly_summary(
     components: Dict[str, Any],
 ) -> str:
     """
-    Use Agentics + Gemini to compress composite anomaly info into a short, readable report.
+    Use Agentics + Gemini to compress composite anomaly info into a short, readable report,
+    including CRSP, Compustat, IBES (EPS + recommendations), CIQ events, and Google Trends
+    when available.
     """
     payload = {
         "ticker": ticker,
@@ -457,8 +506,12 @@ async def generate_anomaly_summary(
         "compustat": components.get("compustat"),
         "ibes_eps": components.get("ibes_eps"),
         "ibes_recs": components.get("ibes_recs"),
+        "ciq": components.get("ciq"),
+        "google_trends": components.get("google_trends"),
         "weights": components.get("weights", {}),
-        "latest_composite_score": components.get("latest_composite_score", composite_score),
+        "latest_composite_score": components.get(
+            "latest_composite_score", composite_score
+        ),
     }
     components_json = json.dumps(payload, default=str, indent=2)
 
@@ -486,6 +539,7 @@ async def generate_anomaly_summary(
           - ticker
           - composite_score in [0,1]
           - ids: mapping with identifiers (ticker, permno, cusip, gvkey)
+
           - crsp: CRSP-specific diagnostics (may include a score and/or time series stats;
                   if available, it may contain a volatility z-score under a key like `vol_z`
                   and a CRSP anomaly score in [0,1]).
@@ -493,14 +547,21 @@ async def generate_anomaly_summary(
                 • score in [0,1] is a fundamentals anomaly score
                 • raw_row has quarterly fundamentals and sector-relative z-scores
           - ibes_eps: { score, raw_row } where:
-                • score in [0,1] is an earnings-surprise anomaly score
+                • score in [0,1] is an earnings-surprise or earnings-uncertainty anomaly score
                 • raw_row has consensus_estimate, actual_eps, num_analysts, etc.
           - ibes_recs: { score, num_records } where:
                 • score in [0,1] reflects bearish/bullish analyst sentiment
                 • num_records is the number of recent recommendation records
-          - weights: { crsp, compustat, ibes_eps, ibes_recs } giving the
-                contribution of each dataset to the composite score.
-          - latest_composite_score: the most recent composite anomaly.
+          - ciq: { score, num_events } where:
+                • score in [0,1] reflects how unusual the density of recent corporate events is
+                  (e.g. M&A, management changes, restructurings, regulatory actions)
+                • num_events is the count of events in the recent window
+          - google_trends: { score } where:
+                • score in [0,1] measures how unusual recent search activity is
+                  relative to historical baselines for the company
+          - weights: { crsp, compustat, ibes_eps, ibes_recs, ciq, trends } giving the
+                relative contribution of each dataset to the composite score.
+          - latest_composite_score: the most recent composite anomaly (same as composite_score).
 
         INTERPRETATION OF composite_score:
           • 0.0–0.3 → "low anomaly"
@@ -525,31 +586,39 @@ async def generate_anomaly_summary(
           1. One-sentence headline stating overall anomaly level for the ticker
              based on composite_score.
 
-          2. A bullet list of 3–5 key points:
+          2. A bullet list of 3–6 key points:
              - CRSP: explain whether market behavior (returns/volatility) is normal,
                mildly unusual, or strongly unusual. If a volatility z-score is present,
                mention its approximate value (e.g., "volatility is about 2.1 standard
-               deviations above its own history") and connect it to the mapping above
-               (e.g., "this corresponds to a moderate volatility anomaly").
+               deviations above its own history") and connect it to the mapping above.
              - Compustat: interpret fundamentals anomaly from compustat.score and
                the raw fundamentals in compustat.raw_row (e.g. margins vs sector,
                leverage, profitability trends).
-             - IBES EPS: describe earnings surprises and analyst coverage based on
-               ibes_eps.score and ibes_eps.raw_row (consensus vs actual EPS,
-               num_analysts, etc.).
+             - IBES EPS: describe earnings surprises or earnings uncertainty based on
+               ibes_eps.score and ibes_eps.raw_row (consensus vs actual EPS, estimate
+               dispersion, num_analysts, etc.), if a score is present.
              - IBES Recommendations: describe analyst sentiment based on
                ibes_recs.score and ibes_recs.num_records (e.g. more bearish,
                neutral, or supportive), if data is present.
+             - CIQ Events: if ciq.score is present, summarize whether recent corporate
+               events (e.g. management changes, M&A, restructurings) are unusually dense
+               or impactful, referring to ciq.num_events where helpful.
+             - Google Trends: if google_trends.score is present, briefly state whether
+               search interest is normal or unusually high/low relative to history.
+               If no score is present, you may omit Google Trends or note that there
+               is no reliable search-volume signal.
 
           3. A final line explaining that the composite anomaly score is a
              weighted combination of these signals, explicitly referencing the
-             weights (e.g. "most weight on CRSP and Compustat").
+             weights (e.g. "with most weight on CRSP and Compustat, and smaller
+             contributions from IBES, CIQ events, and Google Trends where available").
 
         IMPORTANT RULES:
         - Use qualitative language only (e.g. "elevated volatility", "mildly weak
           fundamentals", "strongly negative earnings surprise").
-        - If a dataset has score = null/None, say:
-             "No reliable signal from Compustat" (or the relevant source).
+        - If a dataset has score = null/None, say something like
+             "No reliable signal from Compustat" (or the relevant source), or
+          simply omit it from the bullet list.
         - Refer to the weights to describe which sources are most influential;
           e.g., if weights.crsp is largest, say that market behavior is the
           primary driver of the anomaly.
@@ -562,6 +631,7 @@ async def generate_anomaly_summary(
         result_state = result_state[0]
 
     return result_state.summary_markdown or "Summary generation failed."
+
 
 # --- main app ---
 
@@ -620,7 +690,7 @@ if db_needs_build:
         st.error("Could not build the database. Please check your WRDS credentials and connection.")
         st.stop()
 
-tab_chat, tab_drill = st.tabs(["💬 Text2SQL Agent", "🔍 Company Drilldown"])
+tab_chat, tab_drill, tab_news = st.tabs(["💬 Text2SQL Agent", "🔍 Company Drilldown", "📰 News Digest"])
 
 # =========================
 # TAB 1: Text2SQL Chat Agent
@@ -760,6 +830,7 @@ with tab_chat:
         except Exception as e:
             st.error(f"Workflow failed: {e}")
 
+
 # ================================
 # TAB 2: Company Anomaly Drilldown
 # ================================
@@ -790,6 +861,9 @@ with tab_drill:
             if ts_df.empty:
                 st.error(components.get("error", f"No data found for ticker '{ticker_input}'."))
             else:
+                # Ensure date column is proper datetime.date
+                ts_df["date"] = pd.to_datetime(ts_df["date"]).dt.date
+
                 col1, col2 = st.columns([2, 1])
 
                 with col1:
@@ -822,3 +896,184 @@ with tab_drill:
                     # Optional: tuck raw debug info away
                     with st.expander("🔍 Detailed component breakdown (debug)", expanded=False):
                         st.json(components)
+
+                # ========= NEW: choose anomaly date + window for News Digest =========
+                st.markdown("### 📰 News analysis window")
+
+                # Pick default anomaly date = date with highest composite_score
+                max_row = ts_df.loc[ts_df["composite_score"].idxmax()]
+                default_anom_date = max_row["date"]
+
+                anomaly_dates = sorted(ts_df["date"].unique())
+
+                selected_anom_date = st.selectbox(
+                    "Select anomaly date to investigate with news",
+                    options=anomaly_dates,
+                    index=anomaly_dates.index(default_anom_date),
+                    format_func=lambda d: d.strftime("%Y-%m-%d"),
+                    key="news_anomaly_date",
+                )
+
+                window_days = st.slider(
+                    "Window size (days before/after anomaly)",
+                    min_value=3,
+                    max_value=30,
+                    value=7,
+                    step=1,
+                    key="news_window_days",
+                    help="The News Digest tab will look for news around this anomaly date.",
+                )
+
+                news_start = selected_anom_date - dt.timedelta(days=window_days)
+                news_end = selected_anom_date + dt.timedelta(days=window_days)
+
+                st.caption(
+                    f"News window for {ticker_input.upper()}: "
+                    f"**{news_start} → {news_end}** (±{window_days} days around {selected_anom_date})"
+                )
+
+                # Store for the News Digest tab
+                st.session_state["news_ticker"] = ticker_input.upper()
+                st.session_state["news_start_date"] = news_start
+                st.session_state["news_end_date"] = news_end
+
+                st.success(
+                    "News Digest tab will use this ticker and window to show external news "
+                    "around the selected anomaly."
+                )
+
+
+# =========================
+# TAB 3: News Digest Agent
+# =========================
+with tab_news:
+    st.header("📰 News Digest")
+
+    # context from Tab 2 (Company Drilldown)
+    ticker = st.session_state.get("news_ticker")
+    start_date = st.session_state.get("news_start_date")
+    end_date = st.session_state.get("news_end_date")
+
+    if not ticker or not start_date or not end_date:
+        st.info(
+            "Go to the **Company Anomaly Drilldown** tab, analyze a ticker, and select an "
+            "anomaly date + window. Then return here to see related news and trends."
+        )
+    else:
+        # Look up company name from master_db (with cache-busting via mtime)
+        mtime = MASTER_DB_PATH.stat().st_mtime if MASTER_DB_PATH.exists() else None
+        company_name = get_company_name_for_ticker(ticker, _mtime=mtime)
+
+        # for display
+        if company_name:
+            st.caption(
+                f"Using ticker **{ticker}** (company: **{company_name}**) and "
+                f"anomaly window **{start_date} → {end_date}**."
+            )
+        else:
+            st.caption(
+                f"Using ticker **{ticker}** (no company name found in master_db) and "
+                f"anomaly window **{start_date} → {end_date}**."
+            )
+
+        if st.button("Fetch news & trends"):
+            # ----------------------
+            # GOOGLE NEWS (GNews)
+            # ----------------------
+            st.subheader("🌐📰 Google News (GNews)")
+
+            try:
+                start_tuple = (start_date.year, start_date.month, start_date.day)
+                end_tuple = (end_date.year, end_date.month, end_date.day)
+
+                google_news = GNews(
+                    start_date=start_tuple,
+                    end_date=end_tuple,
+                    max_results=20,
+                )
+
+                #  if company name, try "Company Name + Ticker"
+                #  otherwise fall back to ticker-only
+                articles = []
+                query_used = None
+
+                if company_name:
+                    query1 = f"{company_name} {ticker}"
+                    articles = google_news.get_news(query1) or []
+                    query_used = query1
+
+                    if not articles:
+                        query2 = ticker
+                        articles = google_news.get_news(query2) or []
+                        query_used = query2
+                else:
+                    query_used = ticker
+                    articles = google_news.get_news(query_used) or []
+
+                if not articles:
+                    st.info(
+                        f"No Google News articles found for query '{query_used}' "
+                        f"between {start_date} and {end_date}."
+                    )
+                else:
+                    st.success(
+                        f"Found {len(articles)} Google News articles "
+                        f"for query '{query_used}'."
+                    )
+
+                    for article in articles:
+                        title = article.get("title", "No Title")
+                        url = article.get("url", "#")
+                        publisher = article.get("publisher", {}).get("title", "Unknown")
+                        published = article.get("published date", "Unknown")
+                        desc = article.get("description", "")
+
+                        with st.expander(f"📄 {title}"):
+                            st.write(f"**Source:** {publisher}")
+                            st.write(f"**Published:** {published}")
+                            if desc:
+                                st.write(desc)
+                            st.markdown(f"[Read Article]({url})")
+
+            except Exception as e:
+                st.error(f"Error fetching Google News: {e}")
+
+            # ----------------------
+            # GOOGLE TRENDS
+            # ----------------------
+            st.subheader("📈 Google Trends")
+
+            gt_df = load_google_trends()
+            if gt_df.empty:
+                st.info("No Google Trends data available (external/google_trends.parquet missing or empty).")
+            else:
+                # Keywords you used in your ingestor/config are probably like: "Nvidia", "Apple", etc.
+                # So we try to match either the company name or the ticker, case-insensitive.
+                candidates = []
+                if company_name:
+                    candidates.append(company_name.upper())
+                candidates.append(ticker.upper())
+
+                sub = gt_df[
+                    gt_df["ticker"].astype(str).str.upper().isin(candidates)
+                    & (gt_df["date"] >= start_date)
+                    & (gt_df["date"] <= end_date)
+                ].sort_values("date")
+
+                if sub.empty:
+                    st.info(
+                        "No Google Trends rows found for "
+                        + (f"company '{company_name}' or " if company_name else "")
+                        + f"ticker '{ticker}' in the selected window."
+                    )
+                else:
+                    label = company_name or ticker
+                    st.caption(
+                        f"Google Trends interest for **{label}** "
+                        f"between {start_date} and {end_date}."
+                    )
+                    trends_chart_df = sub.set_index("date")[["trend_score"]]
+                    st.line_chart(trends_chart_df, height=250)
+                    with st.expander("Raw Google Trends data"):
+                        st.dataframe(sub)
+
