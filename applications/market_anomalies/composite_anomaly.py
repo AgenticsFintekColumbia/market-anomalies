@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
+from dataclasses import is_dataclass, asdict
+
 
 import numpy as np
 import pandas as pd
@@ -27,11 +29,12 @@ class AnomalyConfig:
 @dataclass
 class ComponentWeights:
     """Weights for composite anomaly score."""
-    w_crsp: float = 0.4
-    w_compustat: float = 0.25
-    w_ibes_eps: float = 0.2
+    w_crsp: float = 0.35
+    w_compustat: float = 0.20
+    w_ibes_eps: float = 0.20
     w_ibes_recs: float = 0.15
-
+    w_ciq: float = 0.07
+ 
 
 class BayesianConfidenceAssessment:
     """
@@ -232,82 +235,59 @@ class CompositeAnomalyDetector:
     # ---------------------------
     # ID resolution
     # ---------------------------
-    def resolve_ids(self, ticker: str) -> Dict[str, Optional[str]]:
-        """
-        Resolve permno / gvkey / cusip from a ticker.
 
-        Strategy:
-          - CRSP master_db (via TickerResolver) → permno, cusip
-          - Compustat (if it has 'ticker') → gvkey
-          - IBES (if it has 'ticker' & 'cusip') → cusip fallback
-        """
+    def resolve_ids(self, ticker: str) -> Dict[str, Optional[str]]:
         t = ticker.strip().upper()
 
-        # --- 1) CRSP: ticker → permno, cusip via master_db ---
+        # 1) Start with CRSP / master_db via TickerResolver
         ids_crsp = self.ticker_resolver.resolve(t)
+
         ids: Dict[str, Optional[str]] = {
-            "ticker": t,
+            "ticker": ids_crsp.get("ticker", t),
             "permno": ids_crsp.get("permno"),
             "cusip": ids_crsp.get("cusip"),
-            "gvkey": None,
+            "gvkey": ids_crsp.get("gvkey"), 
         }
 
-        # --- 2) Compustat: ticker → gvkey (only if 'ticker' column exists) ---
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cur = conn.cursor()
-                cur.execute("PRAGMA table_info(compustat_quarterly);")
-                comp_cols = [row[1].lower() for row in cur.fetchall()]
-
-                if "gvkey" in comp_cols and "ticker" in comp_cols:
-                    comp_map = pd.read_sql_query(
-                        """
-                        SELECT DISTINCT gvkey
-                        FROM compustat_quarterly
-                        WHERE UPPER(ticker) = ?
-                        ORDER BY datadate DESC
-                        LIMIT 1
-                        """,
-                        conn,
-                        params=(t,),
-                    )
-                    if not comp_map.empty:
-                        ids["gvkey"] = str(comp_map.loc[0, "gvkey"])
-                else:
-                    logger.debug(
-                        "[resolve_ids] compustat_quarterly has no 'ticker' column; "
-                        "skipping gvkey lookup from Compustat."
-                    )
-        except Exception as e:
-            print(f"[resolve_ids] compustat warning: {e}")
-
-        # --- 3) IBES EPS: ticker → cusip (only if both columns exist) ---
-        if ids["cusip"] is None:
+        # 2) If gvkey is still missing, try CIQ as a fallback
+        if ids["gvkey"] is None:
             try:
                 with sqlite3.connect(self.db_path) as conn:
-                    cur = conn.cursor()
-                    cur.execute("PRAGMA table_info(ibes_eps_summary);")
-                    ibes_cols = [row[1].lower() for row in cur.fetchall()]
+                    info = pd.read_sql_query("PRAGMA table_info(ciq_keydev);", conn)
+                    if not info.empty:
+                        cols = {c.lower(): c for c in info["name"]}
 
-                    if "ticker" in ibes_cols and "cusip" in ibes_cols:
-                        ibes_map = pd.read_sql_query(
-                            """
-                            SELECT DISTINCT cusip
-                            FROM ibes_eps_summary
-                            WHERE UPPER(ticker) = ?
-                            LIMIT 1
-                            """,
-                            conn,
-                            params=(t,),
-                        )
-                        if not ibes_map.empty:
-                            ids["cusip"] = str(ibes_map.loc[0, "cusip"])
-                    else:
-                        print("[resolve_ids] ibes_eps_summary has no 'ticker'/'cusip' "
-                              "columns; skipping cusip lookup from IBES.")
+                        gv_col = cols.get("gvkey") or cols.get("GVKEY")
+                        # you may have 'ticker' or 'tic' in CIQ
+                        tic_col = cols.get("ticker") or cols.get("tic")
+                        cusip_col = cols.get("cusip")
+
+                        if gv_col is not None and (tic_col is not None or cusip_col is not None):
+                            params = []
+                            where_clauses = []
+
+                            if tic_col is not None:
+                                where_clauses.append(f"UPPER({tic_col}) = ?")
+                                params.append(t)
+
+                            if cusip_col is not None and ids["cusip"]:
+                                where_clauses.append(f"{cusip_col} = ?")
+                                params.append(ids["cusip"])
+
+                            if where_clauses:
+                                q = f"""
+                                  SELECT DISTINCT {gv_col} AS gvkey
+                                  FROM ciq_keydev
+                                  WHERE {" OR ".join(where_clauses)}
+                                  LIMIT 1
+                                """
+                                ciq_map = pd.read_sql_query(q, conn, params=params)
+                                if not ciq_map.empty:
+                                    ids["gvkey"] = str(ciq_map.loc[0, "gvkey"])
             except Exception as e:
-                print(f"[resolve_ids] ibes lookup warning: {e}")
+                logger.warning("[resolve_ids] CIQ gvkey fallback failed for %s: %s", t, e)
 
+        logger.info("[resolve_ids] %s -> %s", t, ids)
         return ids
 
 
@@ -488,10 +468,61 @@ class CompositeAnomalyDetector:
 
         return df if not df.empty else None
 
+    def _load_recent_ciq_events(
+            self, gvkey: Optional[str], window_days: int = 365
+    ) -> Optional[pd.DataFrame]:
+        """
+        Load recent CIQ key developments for a company identified by gvkey.
+
+        We try to infer a date column and then keep only events in a trailing window.
+        """
+        if gvkey is None:
+            return None
+
+        with sqlite3.connect(self.db_path) as conn:
+            # Inspect schema to find likely date column
+            info = pd.read_sql_query("PRAGMA table_info(ciq_keydev);", conn)
+            if info.empty:
+                return None
+
+            colnames = {c.lower(): c for c in info["name"]}
+
+            if "announce_date" in colnames:
+                date_col = colnames["announce_date"]
+            elif "date" in colnames:
+                date_col = colnames["date"]
+            elif "event_date" in colnames:
+                date_col = colnames["event_date"]
+            else:
+                # No obvious date column
+                return None
+
+            q = f"""
+                SELECT *
+                FROM ciq_keydev
+                WHERE gvkey = ?
+            """
+            df = pd.read_sql_query(q, conn, params=(gvkey,))
+
+        if df.empty or date_col not in df.columns:
+            return None
+
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.dropna(subset=[date_col])
+        if df.empty:
+            return None
+
+        latest_date = df[date_col].max()
+        window_start = latest_date - timedelta(days=window_days)
+        mask = df[date_col].between(window_start, latest_date)
+        window_df = df.loc[mask]
+
+        return window_df if not window_df.empty else None
+
+
     # ---------------------------
     # Component scoring helpers
     # ---------------------------
-
     @staticmethod
     def _logistic(x: float) -> float:
         return float(1.0 / (1.0 + np.exp(-x)))
@@ -499,79 +530,97 @@ class CompositeAnomalyDetector:
     @staticmethod
     def _score_crsp_from_row(row: pd.Series) -> float:
         """
-        Turn CRSP anomalies into a single [0,1] score.
+        Turn CRSP volatility z-scores into a single [0,1] anomaly score.
 
-        Uses vol_z as main driver; magnitude of z == anomaly.
+        Assumes `row["vol_z"]` is a z-score of recent volatility vs its own history.
+        Mapping (two-sided on |z|):
+          - |z| <= 0.5  → ~0.0  (very normal)
+          - |z| = 1.5   → ~0.33
+          - |z| = 2.0   → ~0.5
+          - |z| >= 3.0  → 1.0   (strong volatility anomaly)
         """
-        z = float(row.get("vol_z", 0.0))
+        z = row.get("vol_z", 0.0)
+
+        try:
+            z = float(z)
+        except (TypeError, ValueError):
+            return 0.0  # if it's completely unusable, treat as no anomaly
+
         if np.isnan(z):
-            return 0.5
-        # use magnitude of z (two-sided)
+            return 0.0  # "no CRSP anomaly" rather than 0.5
+
         mag = abs(z)
-        # scale: mag=0 → ~0, mag=2 → ~0.6, mag=3 → ~0.8
-        score = 1.0 - np.exp(-0.5 * (mag ** 2) / (2.0 ** 2))
+
+        # Ignore tiny noise: anything below 0.5 std dev → 0 anomaly
+        if mag <= 0.5:
+            return 0.0
+
+        # Clamp at 3 standard deviations
+        mag_clamped = min(mag, 3.0)
+
+        # Linearly map [0.5, 3.0] → [0.0, 1.0]
+        # shift by 0.5 so 0.5 → 0, 3.0 → 1
+        score = (mag_clamped - 0.5) / (3.0 - 0.5)
         return float(np.clip(score, 0.0, 1.0))
 
-    @staticmethod
-    def _score_compustat(row: Optional[pd.Series]) -> float:
+
+    def _score_compustat(self, row: Optional[pd.Series]) -> Optional[float]:
         """
-        Score fundamentals anomaly based on margin z-scores if available.
-
-        We treat *negative* margin z-scores as more anomalous (weakness).
-        """
-        if row is None:
-            return 0.5
-
-        # Try a few likely column names
-        for col in ["net_margin_zscore", "net_margin_z", "is_net_margin_anomaly"]:
-            if col in row.index:
-                val = row[col]
-                if pd.isna(val):
-                    continue
-                # if it's a 0/1 anomaly flag, just map directly
-                if col.startswith("is_"):
-                    return float(np.clip(val, 0.0, 1.0))
-                z = float(val)
-                # negative z → high anomaly, use logistic
-                return float(1.0 / (1.0 + np.exp(1.0 * z)))  # z << 0 → score ~1
-
-        # fallback if we don't find any margin z-score
-        return 0.5
-
-    @staticmethod
-    def _score_ibes_eps(row: Optional[pd.Series]) -> Optional[float]:
-        """
-        Turn the latest EPS row into an anomaly score in [0,1].
+        Score fundamentals anomaly using Compustat margin z-scores.
 
         Heuristic:
-        - earnings_surprise = (actual - consensus) / |consensus|
-        - Large negative surprise => high anomaly
-        - Large positive surprise => lower anomaly
-        - Higher analyst coverage => more confident score
+            - reads `net_margin_z` and `ebitda_margin_z` (defaults to 0)
+            - uses max(|z|) and maps it into [0,1] with a smooth curve
         """
-        if row is None:
+
+        if row is None or not isinstance(row, pd.Series) or row.empty:
             return None
 
-        cons = row.get("consensus_estimate")
-        actual = row.get("actual_eps")
+        z_net = float(row.get("net_margin_z", 0.0))
+        z_ebitda = float(row.get("ebitda_margin_z", 0.0))
 
-        if pd.isna(cons) or pd.isna(actual):
-            return None
+        # anomaly based on magnitude of deviation from sector average
+        z_mag = max(abs(z_net), abs(z_ebitda))
 
-        surprise = (actual - cons) / (abs(cons) + 1e-10)
-        coverage = row.get("num_analysts", 0.0) or 0.0
-
-        # Raw anomaly: negative surprise -> high score, positive -> low
-        raw = -surprise  # flip: big negative surprise => big positive raw
-        # squash into [0,1] via tanh
-        base_score = 0.5 + 0.5 * np.tanh(raw * 2.0)  # scale factor 2.0 is tunable
-
-        # Coverage factor: with more analysts, lean more on this signal
-        cov_weight = float(np.clip(coverage / 10.0, 0.0, 1.0))
-        # Blend toward neutral (0.5) if coverage is low
-        score = (1 - cov_weight) * 0.5 + cov_weight * base_score
-
+        # map |z| into [0,1] with a smooth curve
+        score = 1.0 - np.exp(- (z_mag / 2.0) ** 2)
         return float(np.clip(score, 0.0, 1.0))
+
+
+    def _score_ibes_eps(self, row: Optional[pd.Series]) -> Optional[float]:
+        """
+        Score latest EPS row into an anomaly score in [0,1].
+
+        Heuristic:
+            - earnings_surprise = (actual - consensus) / |consensus|
+            - Large negative surprise => high anomaly
+            - Large positive surprise => lower anomaly
+            - Higher analyst coverage => more confident score
+        """
+        if row is None or not isinstance(row, pd.Series) or row.empty:
+            return None
+
+        # if actual EPS is available, use surprise as anomaly
+        actual = row.get("actual_eps")
+        if pd.notna(actual):
+            consensus = row.get("consensus_estimate")
+            if pd.notna(consensus) and consensus != 0:
+                surprise = (actual - consensus) / abs(consensus)
+                # map surprise magnitude into [0,1]
+                return float(np.clip(abs(surprise), 0.0, 1.0))
+
+        # Otherwise, fall back to dispersion as a measure of "uncertainty anomaly"
+        est_std = row.get("estimate_std")
+        num_analysts = row.get("num_analysts")
+
+        if pd.isna(est_std) or pd.isna(num_analysts) or num_analysts < 3:
+            return None
+
+        # higher dispersion -> higher anomaly
+        dispersion = float(est_std)
+        score = 1.0 - np.exp(-dispersion * 10.0)  # scale factor tunable
+        return float(np.clip(score, 0.0, 1.0))
+
 
     @staticmethod
     def _score_ibes_recs(df: Optional[pd.DataFrame]) -> Optional[float]:
@@ -617,6 +666,25 @@ class CompositeAnomalyDetector:
         # Map average code from [1,5] -> [0,1]
         avg_code = codes.mean()
         score = (avg_code - 1.0) / 4.0
+        return float(np.clip(score, 0.0, 1.0))
+
+    @staticmethod
+    def _score_ciq_events(df: Optional[pd.DataFrame]) -> Optional[float]:
+        """
+        Turn a window of CIQ events into an anomaly score in [0,1].
+
+        Simple Poisson-like intensity: more events in the window => higher anomaly.
+        """
+        if df is None or df.empty:
+            return None
+
+        n_events = len(df)
+
+        # Treat 2 events per window as 'typical' and scale around that.
+        typical = 2.0
+        lam = n_events / typical
+        score = 1.0 - float(np.exp(-lam))  # 0 events ~0, many events ~1
+
         return float(np.clip(score, 0.0, 1.0))
 
     # ---------------------------
@@ -697,52 +765,99 @@ class CompositeAnomalyDetector:
         ibes_recs_score = self._score_ibes_recs(ibes_recs_df)
 
         # --------------------------------------------------
-        # 5) Composite score = weighted average of AVAILABLE components
+        # 5) CIQ Key Developments (OPTIONAL, via gvkey)
+        # --------------------------------------------------
+        ciq_df = self._load_recent_ciq_events(gvkey) if gvkey is not None else None
+        ciq_score = self._score_ciq_events(ciq_df)
+
+     
+
+        # --------------------------------------------------
+        # Composite score: use ONLY available (non-None) components
         # --------------------------------------------------
         w = self.weights
-        scores = {
+
+        component_scores = {
             "crsp": crsp_score,
             "compustat": comp_score,
             "ibes_eps": ibes_eps_score,
             "ibes_recs": ibes_recs_score,
+            "ciq": ciq_score
         }
-        weights = {
+        component_weights = {
             "crsp": w.w_crsp,
             "compustat": w.w_compustat,
             "ibes_eps": w.w_ibes_eps,
             "ibes_recs": w.w_ibes_recs,
+            "ciq": w.w_ciq
         }
 
-        used_scores = []
-        used_weights = []
-        for k, s in scores.items():
-            if s is None or (isinstance(s, float) and np.isnan(s)):
-                continue
-            used_scores.append(s)
-            used_weights.append(weights[k])
+        # Filter to sources that actually have a score
+        available_keys = [k for k, s in component_scores.items() if s is not None]
 
-        if used_scores:
-            latest_composite = float(np.average(used_scores, weights=used_weights))
+        if available_keys:
+            total_w = sum(component_weights[k] for k in available_keys)
+            latest_composite = sum(
+                component_weights[k] * component_scores[k] for k in available_keys
+            ) / total_w
         else:
-            latest_composite = 0.5  # shrug
+            latest_composite = None  # no usable signals
 
-        # --------------------------------------------------
-        # 6) Per-date composite if we do have CRSP series
-        # --------------------------------------------------
+
         if not ts.empty:
             ts = ts.copy()
-            crsp_series = ts.get("anomaly_crsp", pd.Series(0.5, index=ts.index)).fillna(
-                0.5
+            crsp_series = ts.get("anomaly_crsp", pd.Series(0.5, index=ts.index)).fillna(0.5)
+
+            total_w = (
+                w.w_crsp
+                + w.w_compustat
+                + w.w_ibes_eps
+                + w.w_ibes_recs
+                + w.w_ciq
             )
-            total_w = w.w_crsp + w.w_compustat + w.w_ibes_eps + w.w_ibes_recs
-            ts["composite_score"] = (
-                                            w.w_crsp * crsp_series
-                                            + w.w_compustat * (comp_score if comp_score is not None else 0.5)
-                                            + w.w_ibes_eps * (ibes_eps_score if ibes_eps_score is not None else 0.5)
-                                            + w.w_ibes_recs * (
-                                                ibes_recs_score if ibes_recs_score is not None else 0.5
-                                            )
-                                    ) / total_w
+
+
+            if not ts.empty:
+                ts = ts.copy()
+                crsp_series = ts.get("anomaly_crsp", pd.Series(index=ts.index, dtype=float))
+
+                w = self.weights
+
+                # numerator and denominator for weighted average
+                num = 0.0
+                den = 0.0
+
+                # CRSP: time-varying series
+                if crsp_series is not None and not crsp_series.isna().all():
+                    num = num + w.w_crsp * crsp_series.fillna(0.0)
+                    den = den + w.w_crsp
+
+                # Compustat: scalar score, include only if present
+                if comp_score is not None:
+                    num = num + w.w_compustat * comp_score
+                    den = den + w.w_compustat
+
+                # IBES EPS
+                if ibes_eps_score is not None:
+                    num = num + w.w_ibes_eps * ibes_eps_score
+                    den = den + w.w_ibes_eps
+
+                # IBES Recs
+                if ibes_recs_score is not None:
+                    num = num + w.w_ibes_recs * ibes_recs_score
+                    den = den + w.w_ibes_recs
+
+                # CIQ events
+                if ciq_score is not None:
+                    num = num + w.w_ciq * ciq_score
+                    den = den + w.w_ciq
+
+
+                if den > 0:
+                    ts["composite_score"] = num / den
+                else:
+                    ts["composite_score"] = np.nan
+
 
         components: Dict[str, Any] = {
             "ids": ids,
@@ -769,14 +884,51 @@ class CompositeAnomalyDetector:
                 if isinstance(ibes_recs_df, pd.DataFrame)
                 else 0,
             },
+            "ciq": {
+                "score": float(ciq_score) if ciq_score is not None else None,
+                "num_events": int(len(ciq_df))
+                if isinstance(ciq_df, pd.DataFrame)
+                else 0,
+            },
             "weights": {
                 "crsp": w.w_crsp,
                 "compustat": w.w_compustat,
                 "ibes_eps": w.w_ibes_eps,
                 "ibes_recs": w.w_ibes_recs,
+                "ciq": w.w_ciq
             },
             "latest_composite_score": float(latest_composite),
-        }
+            }
 
         return ts, latest_composite, components
+
+    def _weights_as_dict(self) -> dict:
+        """
+        Safely turn self.weights into a plain dict, whether it's
+        a Pydantic model, dataclass, or simple namespace.
+        """
+        w = self.weights
+
+        # Pydantic v2
+        if hasattr(w, "model_dump"):
+            return w.model_dump()
+
+        # Pydantic v1 style
+        if hasattr(w, "dict"):
+            return w.dict()
+
+        # Dataclass
+        if is_dataclass(w):
+            return asdict(w)
+
+        # Already a dict-like
+        try:
+            return dict(w)
+        except Exception:
+            # Last resort: introspect __dict__
+            return {
+                k: getattr(w, k)
+                for k in dir(w)
+                if not k.startswith("_") and isinstance(getattr(w, k), (int, float))
+            }
 
