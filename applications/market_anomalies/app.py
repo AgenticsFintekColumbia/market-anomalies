@@ -7,12 +7,15 @@ import os
 import sys
 import json
 import yaml
+import requests
+from urllib.parse import quote
 from gnews import GNews
 import datetime as dt
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, ConfigDict, Field
 from composite_anomaly import CompositeAnomalyDetector
+from dotenv import load_dotenv
 
 
 
@@ -21,7 +24,6 @@ MARKET_APP_ROOT = APP_ROOT.parents[0]
 APPLICATIONS_ROOT = APP_ROOT.parents[1]
 PROJECT_ROOT = APP_ROOT.parents[2]
 MASTER_DB_PATH = APPLICATIONS_ROOT / "data" / "wrds" / "master_db.parquet"
-GOOGLE_TRENDS_PATH = MARKET_APP_ROOT / "data" / "external" / "google_trends.parquet"
 
 
 @st.cache_data
@@ -52,17 +54,6 @@ def get_company_name_for_ticker(ticker: str, _mtime: float | None = None) -> str
     return names[0] if len(names) > 0 else None
 
 
-@st.cache_data
-def load_google_trends() -> pd.DataFrame:
-    if not GOOGLE_TRENDS_PATH.exists():
-        return pd.DataFrame(columns=["date", "ticker", "trend_score", "source"])
-
-    df = pd.read_parquet(GOOGLE_TRENDS_PATH)
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    return df
-
-
-
 # --- 1. Page Config (MUST BE FIRST) ---
 st.set_page_config(page_title="WRDS Market Anomaly Hunter", page_icon="📈", layout="wide")
 
@@ -75,6 +66,10 @@ def setup_path_and_env():
     """
     current_file = Path(__file__).resolve()
     current_dir = current_file.parent
+    # Load local .env first so app-level settings override project/global ones.
+    local_env = current_dir / ".env"
+    if local_env.exists():
+        load_dotenv(local_env, override=True)
 
     found_lib_path = None
     project_root = None
@@ -116,10 +111,10 @@ def setup_path_and_env():
 
     # Load .env from project root if found
     if project_root:
-        from dotenv import load_dotenv
         env_path = project_root / ".env"
         if env_path.exists():
-            load_dotenv(env_path)
+            # Use override=False so app-local .env retains priority.
+            load_dotenv(env_path, override=False)
 
     return project_root
 
@@ -148,6 +143,27 @@ else:
     default_db_path = Path("market_anomalies.db")
 
 DB_PATH = os.getenv("SQL_DB_PATH", str(default_db_path))
+LLM_PROVIDER = os.getenv("LLM_PROVIDER") or os.getenv("SELECTED_LLM")
+
+
+def get_llm():
+    """
+    Return an LLM instance honoring optional env override.
+    """
+    provider = (LLM_PROVIDER or "").strip().strip("'\"")
+
+    if provider:
+        try:
+            return AG.get_llm_provider(provider)
+        except Exception as exc:
+            st.error(
+                f"Requested LLM provider '{provider}' is not available. "
+                "Verify the .env credentials/model IDs for that provider."
+            )
+            st.text(f"Details: {exc}")
+            st.stop()
+
+    return AG.get_llm_provider()
 
 
 # --- 4. Data Orchestrator Integration ---
@@ -347,6 +363,7 @@ def get_data_range_stats(db_path):
 
     stats = []
     max_date_overall = "1900-01-01"  # default date
+    crsp_max_date = None
 
     try:
         conn = sqlite3.connect(db_path)
@@ -365,8 +382,11 @@ def get_data_range_stats(db_path):
                 min_d, max_d, count = cursor.fetchone()
                 stats.append(f"Table '{table_name}': {count} rows. Range: {min_d} to {max_d} (Column: {target_col})")
 
+                # Track overall max and CRSP-specific max
                 if max_d and str(max_d) > max_date_overall:
                     max_date_overall = str(max_d)
+                if table_name.lower() == "crsp_daily" and max_d:
+                    crsp_max_date = str(max_d)
             else:
                 cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
                 count = cursor.fetchone()[0]
@@ -376,7 +396,90 @@ def get_data_range_stats(db_path):
     except Exception as e:
         return f"Error getting stats: {e}", "2024-01-01"
 
-    return "\n".join(stats), max_date_overall
+    # Anchor date: prefer CRSP max (since price/return queries rely on it); fallback to overall max
+    anchor_date = crsp_max_date or max_date_overall
+    stats.append(f"Anchor date for queries: {anchor_date} (CRSP max: {crsp_max_date}, overall max: {max_date_overall})")
+
+    return "\n".join(stats), anchor_date
+
+
+def get_table_date_info(db_path):
+    """
+    Structured date coverage per table, with a reliable anchor date.
+    Prefers CRSP max date as anchor, then overall max.
+    """
+    info = {}
+    anchor = None
+
+    preferred_date_cols = {
+        "crsp_daily": "date",
+        "compustat_quarterly": "datadate",
+        "ibes_eps_summary": "estimate_date",
+        "ibes_recommendations": None,  # will detect below
+        "ciq_keydev": None,  # will detect below
+    }
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [t[0] for t in cur.fetchall()]
+
+        for t in tables:
+            cur.execute(f"PRAGMA table_info({t});")
+            cols = [c[1] for c in cur.fetchall()]
+
+            date_col = preferred_date_cols.get(t)
+            if date_col is None:
+                # detection for known recs / ciq
+                lower_cols = [c.lower() for c in cols]
+                if t == "ibes_recommendations":
+                    for cand in ["recommendation_date", "anndats", "announce_date", "date"]:
+                        if cand in lower_cols:
+                            date_col = cols[lower_cols.index(cand)]
+                            break
+                elif t == "ciq_keydev":
+                    for cand in ["event_date", "announce_date", "date"]:
+                        if cand in lower_cols:
+                            date_col = cols[lower_cols.index(cand)]
+                            break
+
+            # generic fallback
+            if date_col is None:
+                date_cols = [c for c in cols if "date" in c.lower() or "time" in c.lower()]
+                if date_cols:
+                    date_col = date_cols[0]
+
+            if date_col:
+                try:
+                    cur.execute(f"SELECT MIN({date_col}), MAX({date_col}), COUNT(*) FROM {t}")
+                    mn, mx, cnt = cur.fetchone()
+                    info[t] = {"date_col": date_col, "min": mn, "max": mx, "count": cnt}
+                    if t == "crsp_daily" and mx:
+                        anchor = str(mx)
+                except Exception as e:
+                    info[t] = {"error": str(e)}
+            else:
+                try:
+                    cur.execute(f"SELECT COUNT(*) FROM {t}")
+                    cnt = cur.fetchone()[0]
+                    info[t] = {"date_col": None, "count": cnt}
+                except Exception as e:
+                    info[t] = {"error": str(e)}
+
+        conn.close()
+    except Exception as e:
+        info["error"] = str(e)
+
+    # If no CRSP anchor, fall back to overall max across tables with dates
+    if anchor is None:
+        max_candidates = [
+            v.get("max") for v in info.values()
+            if isinstance(v, dict) and v.get("max")
+        ]
+        if max_candidates:
+            anchor = str(max(max_candidates))
+    return info, anchor
 
 
 async def async_execute_sql(sql_query: str, db_path: str) -> str:
@@ -411,7 +514,7 @@ async def async_execute_sql(sql_query: str, db_path: str) -> str:
                 try:
                     columns = [description[0] for description in cursor.description]
                 except TypeError:
-                    return "[]"  # dandle cases with no return (DDL, etc.)
+                    return "[]"  # handle cases with no return (DDL, etc.)
 
                 rows = await asyncio.wait_for(cursor.fetchall(), timeout=10)
                 df = pd.DataFrame(rows, columns=columns)
@@ -422,7 +525,9 @@ async def async_execute_sql(sql_query: str, db_path: str) -> str:
 async def get_schema_map(state: Text2sqlQuestion) -> Text2sqlQuestion:
     # 1. Get raw SQLite structure (truth on ground)
     raw_schema = get_schema_cached(DB_PATH)
-    data_stats, max_db_date = get_data_range_stats(DB_PATH)
+    data_stats_text, max_db_date = get_data_range_stats(DB_PATH)
+    date_info, anchor_date = get_table_date_info(DB_PATH)
+    max_db_date = anchor_date or max_db_date
 
     rich_docs = {}
     try:
@@ -466,13 +571,19 @@ async def get_schema_map(state: Text2sqlQuestion) -> Text2sqlQuestion:
     full_context = {
         "sqlite_database_structure": raw_schema,
         "dataset_semantic_documentation": rich_docs,
-        "data_availability_summary": data_stats,
+        "data_availability_summary": {
+            "text": data_stats_text,
+            "tables": date_info,
+        },
         "latest_data_date": max_db_date,
         "domain_knowledge": anomaly_cheatsheet,
         "general_guidance": f"""
-        - **IMPORTANT: The database contains historical data ending on {max_db_date}.**
+        - **IMPORTANT: The database contains historical data ending on {max_db_date} (anchor derived from CRSP if present).**
         - **CRITICAL RULE:** DO NOT use `DATE('now')` or `DATE('now', '-3 months')` because the database has NO future data.
         - **INSTEAD USE:** `DATE('{max_db_date}')` as the anchor. For "last 3 months", use `DATE('{max_db_date}', '-3 months')`.
+        - Preferred date columns: crsp_daily.date, compustat_quarterly.datadate, ibes_eps_summary.estimate_date,
+          ibes_recommendations.recommendation_date, ciq_keydev.event_date.
+        - security_master has no date column; avoid date filters on that table.
         - Use 'dataset_semantic_documentation' to understand column meanings.
         - Use 'sqlite_database_structure' for exact column names.
         """
@@ -527,7 +638,7 @@ async def generate_anomaly_summary(
         agent = AG()
         agent.states = [state]
 
-    agent.llm = AG.get_llm_provider()
+    agent.llm = get_llm()
 
     agent = await agent.self_transduction(
         ["ticker", "composite_score", "components_json"],
@@ -556,18 +667,15 @@ async def generate_anomaly_summary(
                 • score in [0,1] reflects how unusual the density of recent corporate events is
                   (e.g. M&A, management changes, restructurings, regulatory actions)
                 • num_events is the count of events in the recent window
-          - google_trends: { score } where:
-                • score in [0,1] measures how unusual recent search activity is
-                  relative to historical baselines for the company
-          - weights: { crsp, compustat, ibes_eps, ibes_recs, ciq, trends } giving the
+          - weights: { crsp, compustat, ibes_eps, ibes_recs, ciq } giving the
                 relative contribution of each dataset to the composite score.
           - latest_composite_score: the most recent composite anomaly (same as composite_score).
 
         INTERPRETATION OF composite_score:
-          • 0.0–0.3 → "low anomaly"
-          • 0.3–0.6 → "moderate anomaly"
-          • 0.6–0.8 → "high anomaly"
-          • 0.8–1.0 → "extreme anomaly"
+            • 0.0–0.3 → **🟢 : Low Anomaly**
+            • 0.3–0.6 → **🟡 : Moderate anomaly**
+            • 0.6–0.8 → **🟠 : High anomaly**
+            • 0.8–1.0 → **🔴 : Extreme anomaly**
 
         IMPORTANT: The CRSP volatility anomaly score is derived from a volatility z-score (vol_z)
         using this approximate mapping from |z| to anomaly level:
@@ -583,8 +691,8 @@ async def generate_anomaly_summary(
         TASK:
         - Produce a SHORT Markdown report (max ~10 lines) with:
 
-          1. One-sentence headline stating overall anomaly level for the ticker
-             based on composite_score.
+          1. A single bold text line containing exactly and only the emoji label 
+             defined in the INTERPRETATION section above (e.g., "**🔴 : Extreme anomaly**").
 
           2. A bullet list of 3–6 key points:
              - CRSP: explain whether market behavior (returns/volatility) is normal,
@@ -603,15 +711,12 @@ async def generate_anomaly_summary(
              - CIQ Events: if ciq.score is present, summarize whether recent corporate
                events (e.g. management changes, M&A, restructurings) are unusually dense
                or impactful, referring to ciq.num_events where helpful.
-             - Google Trends: if google_trends.score is present, briefly state whether
-               search interest is normal or unusually high/low relative to history.
-               If no score is present, you may omit Google Trends or note that there
-               is no reliable search-volume signal.
+
 
           3. A final line explaining that the composite anomaly score is a
              weighted combination of these signals, explicitly referencing the
              weights (e.g. "with most weight on CRSP and Compustat, and smaller
-             contributions from IBES, CIQ events, and Google Trends where available").
+             contributions from IBES, and CIQ events where available").
 
         IMPORTANT RULES:
         - Use qualitative language only (e.g. "elevated volatility", "mildly weak
@@ -638,14 +743,31 @@ async def generate_anomaly_summary(
 with st.sidebar:
     st.header("⚙️ Configuration")
 
-    env_api_key = os.getenv("GEMINI_API_KEY")
+    provider_display = (LLM_PROVIDER or "auto (first available)").strip().strip("'\"")
+    provider_lower = provider_display.lower()
+
+    # Pick the env var name based on provider; default to OpenAI/Gemini
+    if provider_lower == "openai":
+        api_env_var = "OPENAI_API_KEY"
+        input_label = "OpenAI API Key"
+    elif provider_lower == "watsonx":
+        api_env_var = "WATSONX_APIKEY"
+        input_label = "WatsonX API Key"
+    elif provider_lower == "gemini":
+        api_env_var = "GEMINI_API_KEY"
+        input_label = "Gemini API Key"
+    else:
+        api_env_var = "OPENAI_API_KEY"
+        input_label = f"{provider_display} API Key"
+
+    env_api_key = os.getenv(api_env_var)
     if env_api_key:
         api_key = env_api_key
-        st.success(f"🔑 API Key loaded from env")
+        st.success(f"🔑 API Key loaded from env (provider: {provider_display})")
     else:
-        api_key = st.text_input("Gemini API Key", type="password")
+        api_key = st.text_input(input_label, type="password")
         if api_key:
-            os.environ["GEMINI_API_KEY"] = api_key
+            os.environ[api_env_var] = api_key
 
     st.info("Using `IB Agentics` Framework")
     st.markdown(f"**Database Path:**\n`{DB_PATH}`")
@@ -657,7 +779,7 @@ with st.sidebar:
 
 
 st.title("📊 WRDS Market Anomaly Hunter")
-st.markdown("Find market anomalies (Momentum, PEAD, Reversals) using natural language.")
+st.markdown("Find market anomalies using natural language.")
 
 db_needs_build = False
 if not os.path.exists(DB_PATH):
@@ -714,7 +836,19 @@ with tab_chat:
         st.chat_message("user").write(prompt)
 
         if not api_key:
-            st.error("Please provide a Gemini API Key.")
+            st.error("Please provide an API Key.")
+            st.stop()
+
+        cache = st.session_state.setdefault("t2sql_cache", {})
+        if prompt in cache:
+            cached = cache[prompt]
+            st.info("Using cached Text2SQL result (no LLM call).")
+            if cached.get("generated_query"):
+                st.code(cached["generated_query"], language="sql")
+            response_text = cached.get("final_report", "")
+            if response_text:
+                st.write(response_text)
+                st.session_state.messages.append({"role": "assistant", "content": response_text})
             st.stop()
 
         async def run_agentic_workflow():
@@ -737,7 +871,7 @@ with tab_chat:
                     agent = AG()
                     agent.states = [state]
 
-                agent.llm = AG.get_llm_provider()
+                agent.llm = get_llm()
 
                 if agent.states and isinstance(agent.states[0], tuple):
                     st.warning("Detected tuple state, attempting to unwrap...")
@@ -797,13 +931,45 @@ with tab_chat:
                         ["question", "generated_query", "system_output_df"],
                         ["final_report"],
                         instructions="""
-                        You are a hedge fund analyst. 
-                        1. Read the user's question and the SQL results.
-                        2. Identify if there is a market anomaly (e.g., significant abnormal returns, earnings surprise).
-                        3. Write a concise report highlighting the top findings.
-                        4. Suggest a follow-up query if the data is inconclusive.
-                        """
+                    You are a Senior Equity Analyst at a top-tier hedge fund.
+
+                    You are operating on a state object with these fields:
+                    - `question`: the user's natural language question.
+                    - `generated_query`: the SQL query you previously generated.
+                    - `system_output_df`: the SQL result as a JSON-serialized table.
+                    - `final_report`: an initially empty string where you must write your answer.
+
+                    YOUR JOB:
+                    - Read `question` and `system_output_df`.
+                    - Then **write a complete Markdown report into the `final_report` field**.
+                    - Do not modify `question`, `generated_query`, or `system_output_df`.
+
+                    REPORT REQUIREMENTS (content of `final_report`):
+                    1. **Executive Summary**  
+                    A single, punchy paragraph summarizing the trend.
+
+                    2. **Data Table**  
+                    - Emit a Markdown table.  
+                    - Columns: `Ticker | Metric | Value | Context`.  
+                    - If there are >10 rows, show only the most significant examples
+                        (e.g., top 5 and bottom 5 by surprise or magnitude).
+
+                    3. **Key Observations**  
+                    - Group your observations into two distinct blocks separated by an empty line:
+                    ***Favorable / Normal Factors:***
+                    - Use `✅` bullets for data points that look healthy, normal, or supportive (e.g., low volatility, strong fundamentals, normal search volume). Please use a new line for each bullet point.
+                    ***Unfavorable / Anomalous Factors:***
+                    - Use `⚠️` bullets for data points that are driving the anomaly score up (e.g., high volatility z-score, negative earnings surprise, unusual corporate event density). Please use a new line for each bullet point.
+                    - If a category is empty (e.g., everything is anomalous), omit the Positive section entirely, and vice versa.
+           
+                    TONE:
+                    - Professional, objective, and glanceable.
+                    - Do NOT use conversational filler like “Here is the data you asked for.”
+                    - If `system_output_df` is empty or invalid, set `final_report` to:
+                    "No relevant market data found for this query."
+                    """
                     )
+
 
                     final_state_obj = agent.states[0]
                     if isinstance(final_state_obj, tuple):
@@ -821,10 +987,18 @@ with tab_chat:
                     )
 
                 status.update(label="✅ Workflow Complete", state="complete", expanded=False)
-                return final_report
+                return {
+                    "final_report": final_report,
+                    "generated_query": state.generated_query,
+                    "results": results,
+                }
 
         try:
-            response_text = asyncio.run(run_agentic_workflow())
+            workflow_result = asyncio.run(run_agentic_workflow())
+            response_text = workflow_result.get("final_report", "")
+            cache[prompt] = workflow_result  # cache the run
+            if workflow_result.get("generated_query"):
+                st.code(workflow_result["generated_query"], language="sql")
             st.write(response_text)
             st.session_state.messages.append({"role": "assistant", "content": response_text})
         except Exception as e:
@@ -980,7 +1154,7 @@ with tab_news:
             # ----------------------
             # GOOGLE NEWS (GNews)
             # ----------------------
-            st.subheader("🌐📰 Google News (GNews)")
+            st.subheader("🌐 Google News")
 
             try:
                 start_tuple = (start_date.year, start_date.month, start_date.day)
@@ -1037,43 +1211,3 @@ with tab_news:
 
             except Exception as e:
                 st.error(f"Error fetching Google News: {e}")
-
-            # ----------------------
-            # GOOGLE TRENDS
-            # ----------------------
-            st.subheader("📈 Google Trends")
-
-            gt_df = load_google_trends()
-            if gt_df.empty:
-                st.info("No Google Trends data available (external/google_trends.parquet missing or empty).")
-            else:
-                # Keywords you used in your ingestor/config are probably like: "Nvidia", "Apple", etc.
-                # So we try to match either the company name or the ticker, case-insensitive.
-                candidates = []
-                if company_name:
-                    candidates.append(company_name.upper())
-                candidates.append(ticker.upper())
-
-                sub = gt_df[
-                    gt_df["ticker"].astype(str).str.upper().isin(candidates)
-                    & (gt_df["date"] >= start_date)
-                    & (gt_df["date"] <= end_date)
-                ].sort_values("date")
-
-                if sub.empty:
-                    st.info(
-                        "No Google Trends rows found for "
-                        + (f"company '{company_name}' or " if company_name else "")
-                        + f"ticker '{ticker}' in the selected window."
-                    )
-                else:
-                    label = company_name or ticker
-                    st.caption(
-                        f"Google Trends interest for **{label}** "
-                        f"between {start_date} and {end_date}."
-                    )
-                    trends_chart_df = sub.set_index("date")[["trend_score"]]
-                    st.line_chart(trends_chart_df, height=250)
-                    with st.expander("Raw Google Trends data"):
-                        st.dataframe(sub)
-
