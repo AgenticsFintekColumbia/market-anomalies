@@ -236,56 +236,63 @@ class CompositeAnomalyDetector:
     # ID resolution
     # ---------------------------
 
+
     def resolve_ids(self, ticker: str) -> Dict[str, Optional[str]]:
         t = ticker.strip().upper()
 
-        # 1) Start with CRSP / master_db via TickerResolver
+        # 1) First try CRSP/master_db via TickerResolver
         ids_crsp = self.ticker_resolver.resolve(t)
 
         ids: Dict[str, Optional[str]] = {
             "ticker": ids_crsp.get("ticker", t),
             "permno": ids_crsp.get("permno"),
             "cusip": ids_crsp.get("cusip"),
-            "gvkey": ids_crsp.get("gvkey"), 
+            "gvkey": ids_crsp.get("gvkey"),
         }
 
-        # 2) If gvkey is still missing, try CIQ as a fallback
-        if ids["gvkey"] is None:
-            try:
+        # 2) If we still don't have permno/gvkey, try IBES → CUSIP → master_db
+        try:
+            needs_permno = ids["permno"] is None
+            needs_gvkey = ids["gvkey"] is None
+            needs_cusip = ids["cusip"] is None
+
+            if needs_permno or needs_gvkey or needs_cusip:
                 with sqlite3.connect(self.db_path) as conn:
-                    info = pd.read_sql_query("PRAGMA table_info(ciq_keydev);", conn)
+                    info = pd.read_sql_query("PRAGMA table_info(ibes_eps_summary);", conn)
                     if not info.empty:
                         cols = {c.lower(): c for c in info["name"]}
 
-                        gv_col = cols.get("gvkey") or cols.get("GVKEY")
-                        # you may have 'ticker' or 'tic' in CIQ
                         tic_col = cols.get("ticker") or cols.get("tic")
                         cusip_col = cols.get("cusip")
 
-                        if gv_col is not None and (tic_col is not None or cusip_col is not None):
-                            params = []
-                            where_clauses = []
+                        if tic_col and cusip_col:
+                            q = f"""
+                                SELECT {tic_col} AS ticker,
+                                    {cusip_col} AS cusip
+                                FROM ibes_eps_summary
+                                WHERE UPPER({tic_col}) = ?
+                                ORDER BY estimate_date DESC
+                                LIMIT 1
+                            """
+                            ibes_map = pd.read_sql_query(q, conn, params=(t,))
+                            if not ibes_map.empty:
+                                cusip = str(ibes_map.loc[0, "cusip"]).strip()
+                                if not ids["cusip"]:
+                                    ids["cusip"] = cusip
 
-                            if tic_col is not None:
-                                where_clauses.append(f"UPPER({tic_col}) = ?")
-                                params.append(t)
-
-                            if cusip_col is not None and ids["cusip"]:
-                                where_clauses.append(f"{cusip_col} = ?")
-                                params.append(ids["cusip"])
-
-                            if where_clauses:
-                                q = f"""
-                                  SELECT DISTINCT {gv_col} AS gvkey
-                                  FROM ciq_keydev
-                                  WHERE {" OR ".join(where_clauses)}
-                                  LIMIT 1
-                                """
-                                ciq_map = pd.read_sql_query(q, conn, params=params)
-                                if not ciq_map.empty:
-                                    ids["gvkey"] = str(ciq_map.loc[0, "gvkey"])
-            except Exception as e:
-                logger.warning("[resolve_ids] CIQ gvkey fallback failed for %s: %s", t, e)
+                                # Now map CUSIP → permno/gvkey via master_db
+                                master = self.ticker_resolver.master
+                                # master["cusip"] is already normalized to str
+                                rows = master[master["cusip"] == cusip]
+                                if not rows.empty:
+                                    # pick the most recent name
+                                    row = rows.sort_values("namedt").tail(1).iloc[0]
+                                    if ids["permno"] is None and "permno" in row.index:
+                                        ids["permno"] = str(row["permno"])
+                                    if ids["gvkey"] is None and "gvkey" in row.index and pd.notna(row["gvkey"]):
+                                        ids["gvkey"] = str(row["gvkey"])
+        except Exception as e:
+            logger.warning("[resolve_ids] IBES→CUSIP fallback failed for %s: %s", t, e)
 
         logger.info("[resolve_ids] %s -> %s", t, ids)
         return ids
@@ -931,4 +938,3 @@ class CompositeAnomalyDetector:
                 for k in dir(w)
                 if not k.startswith("_") and isinstance(getattr(w, k), (int, float))
             }
-
